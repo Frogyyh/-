@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="ko">
+
+<head>
+    <meta charset="utf-8" />
+    <title>개굴라이더</title>
+    <style>
+        /* HTML과 BODY 초기화 및 전체 화면 적용 */
+        html,
+        body {
+            margin: 0;
+            height: 100%;
+            background: #000;
+            /* 기본 배경 검정 */
+            overflow: hidden;
+            /* 스크롤 제거 */
+        }
+
+        /* 화면 상단 힌트 표시용 DIV */
+        #hint {
+            position: fixed;
+            left: 50%;
+            top: 16px;
+            transform: translateX(-50%);
+            color: #fff;
+            font: 14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Arial;
+            padding: 8px 12px;
+            background: rgba(0, 0, 0, .35);
+            /* 반투명 배경 */
+            border-radius: 8px;
+            user-select: none;
+            /* 텍스트 선택 방지 */
+            pointer-events: none;
+            /* 클릭 방지 */
+        }
+
+        /* 로딩 스크린 전체 스타일 */
+        #loadingScreen {
+            position: fixed;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+
+        /* 로딩중 글씨 스타일 */
+        .loading_text {
+            font-size: 20px;
+            margin-top: 20px;
+            color: #ffffff;
+        }
+
+        /* 스피너(회전 아이콘) 스타일 */
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #3498db;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        #speedometerCanvas {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.6);
+            border-radius: 50%;
+        }
+    </style>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <!-- ImportMap을 사용한 모듈 경로 지정 -->
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.179.1/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.179.1/examples/jsm/"
+      }
+    }
+    </script>
+</head>
+
+<body>
+    <!-- 조작법 힌트 -->
+    <div id="hint">클릭 → 마우스 잠금, W 전진, S 후진, A/D 조향 바퀴 회전, Shift 드리프트, Space 브레이크</div>
+    <div id="loadingScreen">
+        <div class="spinner"></div>
+        <div class="loading_text">로딩중...(만약응답없음메세지가 떠도 "대기" 눌러주세요!)</div>
+    </div>
+    <canvas id="speedometerCanvas" width="200" height="200"></canvas>
+    <script type="module">
+        // ===== 모듈 임포트 =====
+        import * as THREE from 'three'; // Three.js 메인 모듈
+        import Stats from 'three/addons/libs/stats.module.js'; // FPS 표시용 Stats
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'; // GLB/GLTF 모델 로더
+        import { Octree } from 'three/addons/math/Octree.js'; // 충돌 감지용 옥트리
+        import { Capsule } from 'three/addons/math/Capsule.js'; // 충돌용 캡슐 객체
+        // frog
+        // ===== 플레이어 및 물리 상수 =====
+        const MAX_SPEED = 32; // 최대 속도
+        const ACCELERATION = 15; // 가속wa
+        const DECELERATION = 20; // 감속
+        const BRAKE_DECELERATION = 100; // 브레이크 감속
+        const TURN_SPEED = Math.PI * 0.8; // 기본 조향 속도
+        const DRIFT_TURN_SPEED = Math.PI * 2.4; // 드리프트 시 조향 속도
+        const DRIFT_SIDE_VEL_MAX = 12; // 드리프트 최대 측면 속도
+        const DRIFT_SIDE_VEL_ACCEL = 5; // 드리프트 측면 가속
+        const DRIFT_TILT_ANGLE = Math.PI / 20; // 드리프트 시 차량 기울기
+        const STEER_MAX_ANGLE = Math.PI / 6; // 최대 조향각
+        const STEER_RETURN_SPEED = 5; // 스티어 자동 복원 속도
+        const GRAVITY = -30; // 중력
+
+        // ===== 씬 / 카메라 / 렌더러 설정 =====
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x88ccee); // 배경색 하늘색
+
+        const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 3000);
+        camera.position.set(0, 3, 8); // 초기 카메라 위치
+        camera.rotation.z = 0;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true; // 그림자 활성화
+        document.body.appendChild(renderer.domElement);
+
+        // 조명 설정
+        scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.0)); // 하늘/바닥광
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        dirLight.castShadow = true;
+        scene.add(dirLight);
+
+        // FPS 표시
+        const stats = new Stats();
+        document.body.appendChild(stats.dom);
+
+        // ===== 옥트리 충돌 감지용 =====
+        const worldOctree = new Octree();
+        let worldReady = false;
+
+        // ===== 플레이어 상태 객체 =====
+        const player = {
+            position: new THREE.Vector3(0, 10, 0),
+            headingAngle: 0,
+            speed: 0,
+            driftSideVelocity: 0,
+            tiltAngle: 0,
+            steerAngle: 0,
+            isDrifting: false,
+            isBraking: false,
+            velocity: new THREE.Vector3(),
+            collider: new Capsule(
+                new THREE.Vector3(0, 1.0, 0),
+                new THREE.Vector3(0, 2.2, 0),
+                0.35
+            ), // 캡슐 충돌체
+            onGround: false,
+        };
+
+        let playerModel = null; // 카트 모델
+
+        document.addEventListener("DOMContentLoaded", function () {
+            console.log('게임 리소스 로딩 시작...');
+            loadGameAssets().then(() => {
+                $('#loadingScreen').fadeOut(500, function () {
+                    startGame();
+                });
+            }).catch(error => {
+                console.error('리소스 로딩 오류:', error);
+                $('#loadingScreen').fadeOut(500);
+            });
+        });
+        async function loadGameAssets() {
+            await new Promise(resolve => setTimeout(resolve, 6000));
+            console.log('리소스 로딩 완료!');
+        }
+        function startGame() {
+            console.log('게임 시작!');
+        }
+        // ===== 키보드 입력 처리 =====
+        const key = {};
+        window.addEventListener('keydown', e => {
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.isDrifting = true;
+            if (e.code === 'Space') player.isBraking = true;
+            key[e.code] = true;
+        });
+        window.addEventListener('keyup', e => {
+            if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') player.isDrifting = false;
+            if (e.code === 'Space') player.isBraking = false;
+            key[e.code] = false;
+        });
+
+        // 마우스 클릭 시 포인터 잠금
+        document.body.addEventListener('click', () => document.body.requestPointerLock());
+        document.addEventListener('pointerlockchange', () => {
+            document.getElementById('hint').style.display =
+                (document.pointerLockElement === document.body) ? 'none' : 'block';
+        });
+
+        // ===== 맵 모델 로드 =====
+        const loader = new GLTFLoader();
+        loader.load(
+            'models/gltf/driftrace.glb',
+            (gltf) => {
+                // 각 Mesh 설정
+                gltf.scene.traverse(obj => {
+                    if (obj.isMesh) {
+                        const geo = obj.geometry;
+                        if (!geo || !geo.attributes?.position?.array) {
+                            obj.parent?.remove(obj); // 지오메트리 없는 Mesh 제거
+                        } else {
+                            obj.castShadow = true;
+                            obj.receiveShadow = true;
+                        }
+                    }
+                });
+                scene.add(gltf.scene);
+                worldOctree.fromGraphNode(gltf.scene); // 충돌 옥트리 생성
+                worldReady = true;
+
+                // 플레이어 초기 위치 설정
+                player.position.set(0, 10, 0);
+                const height = player.collider.end.y - player.collider.start.y;
+                player.collider.start.set(player.position.x, player.position.y, player.position.z);
+                player.collider.end.set(player.position.x, player.position.y + height, player.position.z);
+            },
+            undefined,
+            (err) => console.error('GLB 로드 실패:', err)
+        );
+
+        // ===== 플레이어 카트 모델 로드 =====
+        loader.load(
+            'models/go_kart.glb',
+            (gltf) => {
+                playerModel = gltf.scene;
+                playerModel.traverse(obj => {
+                    if (obj.isMesh) {
+                        obj.castShadow = true;
+                        obj.receiveShadow = true;
+                    }
+                });
+                playerModel.scale.set(0.01, 0.01, 0.01); // 모델 크기 조정
+                scene.add(playerModel);
+                playerModel.position.copy(player.position);
+                playerModel.rotation.y = player.headingAngle;
+            },
+            undefined,
+            (err) => console.error('카트 모델 로드 실패:', err)
+        );
+
+        // ===== 파티클 시스템 =====
+        const smokeParticles = [];
+        const fireParticles = [];
+
+        const particleMaterialSmoke = new THREE.PointsMaterial({
+            color: 0x555555,
+            size: 0.5,
+            transparent: true,
+            opacity: 0.7,
+        });
+
+        const particleMaterialFire = new THREE.PointsMaterial({
+            color: 0xff6600,
+            size: 0.7,
+            transparent: true,
+            opacity: 0.9,
+        });
+
+        let smokeCooldown = 0;
+        let fireCooldown = 0;
+
+        function createSmokeParticle(position) {
+            smokeParticles.push({ pos: position.clone(), lifetime: 0.8 });
+        }
+
+        function createFireParticle(position) {
+            fireParticles.push({ pos: position.clone(), lifetime: 0.2 });
+        }
+
+        function updateParticles(dt) {
+            smokeCooldown -= dt;
+            fireCooldown -= dt;
+
+            // 기존 파티클 업데이트
+            for (let i = smokeParticles.length - 1; i >= 0; i--) {
+                const p = smokeParticles[i];
+                p.pos.y += dt * 0.5;
+                p.lifetime -= dt;
+                if (p.lifetime <= 0) smokeParticles.splice(i, 1);
+            }
+
+            for (let i = fireParticles.length - 1; i >= 0; i--) {
+                const p = fireParticles[i];
+                p.pos.y += dt * 0.5;
+                p.lifetime -= dt;
+                if (p.lifetime <= 0) fireParticles.splice(i, 1);
+            }
+
+            // 이전 Points 제거 후 새로 생성
+            scene.remove(scene.getObjectByName('smokePoints'));
+            scene.remove(scene.getObjectByName('firePoints'));
+
+            if (smokeParticles.length > 0) {
+                const smokeGeo = new THREE.BufferGeometry().setFromPoints(smokeParticles.map(p => p.pos));
+                const smokePoints = new THREE.Points(smokeGeo, particleMaterialSmoke);
+                smokePoints.name = 'smokePoints';
+                scene.add(smokePoints);
+            }
+
+            if (fireParticles.length > 0) {
+                const fireGeo = new THREE.BufferGeometry().setFromPoints(fireParticles.map(p => p.pos));
+                const firePoints = new THREE.Points(fireGeo, particleMaterialFire);
+                firePoints.name = 'firePoints';
+                scene.add(firePoints);
+            }
+        }
+
+        // ===== 메인 업데이트 함수 =====
+        let last = performance.now();
+
+        function update(dt) {
+            if (!worldReady) {
+                updateCamera(); // 맵 준비 전 카메라만 업데이트
+                return;
+            }
+
+            // ===== 조향 처리 =====
+            if (key['KeyA']) player.steerAngle += TURN_SPEED * dt;
+            else if (key['KeyD']) player.steerAngle -= TURN_SPEED * dt;
+            else {
+                // 조향 자동 복원
+                if (player.steerAngle > 0) { player.steerAngle -= STEER_RETURN_SPEED * dt; if (player.steerAngle < 0) player.steerAngle = 0; }
+                else if (player.steerAngle < 0) { player.steerAngle += STEER_RETURN_SPEED * dt; if (player.steerAngle > 0) player.steerAngle = 0; }
+            }
+            player.steerAngle = THREE.MathUtils.clamp(player.steerAngle, -STEER_MAX_ANGLE, STEER_MAX_ANGLE);
+
+            const currentTurnSpeed = player.isDrifting ? DRIFT_TURN_SPEED : TURN_SPEED;
+            if (Math.abs(player.speed) > 0.1) {
+                const speedRatio = Math.min(Math.abs(player.speed) / MAX_SPEED, 1);
+                const effectiveTurnSpeed = THREE.MathUtils.lerp(currentTurnSpeed, currentTurnSpeed * 0.3, speedRatio);
+                player.headingAngle += player.steerAngle * effectiveTurnSpeed * dt * (player.speed > 0 ? 1 : -1);
+            }
+
+            // ===== 가속 / 감속 처리 =====
+            if (key['KeyW']) player.speed += ACCELERATION * dt;
+            else if (key['KeyS']) player.speed -= ACCELERATION * dt * 0.6;
+            else {
+                if (player.speed > 0) { player.speed -= DECELERATION * dt; if (player.speed < 0) player.speed = 0; }
+                else if (player.speed < 0) { player.speed += DECELERATION * dt; if (player.speed > 0) player.speed = 0; }
+            }
+
+            if (player.isBraking) {
+                if (player.speed > 0) { player.speed -= BRAKE_DECELERATION * dt; if (player.speed < 0) player.speed = 0; }
+                else if (player.speed < 0) { player.speed += BRAKE_DECELERATION * dt; if (player.speed > 0) player.speed = 0; }
+            }
+
+            player.speed = THREE.MathUtils.clamp(player.speed, -MAX_SPEED * 0.5, MAX_SPEED);
+
+            // ===== 드리프트 처리 =====
+            if (player.isDrifting) {
+                const steerSign = Math.sign(player.steerAngle) || 1;
+                const targetSideVel = DRIFT_SIDE_VEL_MAX * (player.speed / MAX_SPEED) * steerSign;
+                player.driftSideVelocity += (targetSideVel - player.driftSideVelocity) * dt * DRIFT_SIDE_VEL_ACCEL;
+                const tiltTarget = DRIFT_TILT_ANGLE * steerSign;
+                player.tiltAngle += (tiltTarget - player.tiltAngle) * dt * 5;
+            } else {
+                player.driftSideVelocity += (0 - player.driftSideVelocity) * dt * 2;
+                player.tiltAngle += (0 - player.tiltAngle) * dt * 5;
+                player.driftSideVelocity = 0;
+            }
+
+            // ===== 중력 적용 =====
+            player.velocity.y += GRAVITY * dt;
+
+            // 전후, 측면 속도 계산
+            const forwardDir = new THREE.Vector3(Math.sin(player.headingAngle), 0, Math.cos(player.headingAngle));
+            const sideDir = new THREE.Vector3(-forwardDir.z, 0, forwardDir.x);
+            const horizontalVelocity = forwardDir.clone().multiplyScalar(player.speed)
+                .add(sideDir.clone().multiplyScalar(player.driftSideVelocity));
+            player.velocity.x = horizontalVelocity.x;
+            player.velocity.z = horizontalVelocity.z;
+
+            // 위치 업데이트
+            player.position.addScaledVector(player.velocity, dt);
+
+            // 캡슐 충돌체 업데이트
+            const height = player.collider.end.y - player.collider.start.y;
+            player.collider.start.set(player.position.x, player.position.y, player.position.z);
+            player.collider.end.set(player.position.x, player.position.y + height, player.position.z);
+
+            // 충돌 처리
+            const hit = worldOctree.capsuleIntersect(player.collider);
+            player.onGround = false;
+            if (hit) {
+                player.onGround = hit.normal.y > 0;
+                if (player.onGround) {
+                    if (player.velocity.y < 0) player.velocity.y = 0;
+                    player.position.addScaledVector(hit.normal, hit.depth);
+                    player.collider.start.addScaledVector(hit.normal, hit.depth);
+                    player.collider.end.addScaledVector(hit.normal, hit.depth);
+                } else {
+                    player.velocity.addScaledVector(hit.normal, -hit.normal.dot(player.velocity));
+                    player.position.addScaledVector(hit.normal, hit.depth);
+                    player.collider.start.addScaledVector(hit.normal, hit.depth);
+                    player.collider.end.addScaledVector(hit.normal, hit.depth);
+                }
+            }
+
+            // 바닥 아래로 떨어졌을 때 초기화
+            if (player.position.y < -100) {
+                player.position.set(0, 20, 0);
+                player.speed = 0;
+                player.driftSideVelocity = 0;
+                player.tiltAngle = 0;
+                player.steerAngle = 0;
+                player.headingAngle = 0;
+                player.velocity.set(0, 0, 0);
+                player.collider.start.set(player.position.x, player.position.y, player.position.z);
+                player.collider.end.set(player.position.x, player.position.y + height, player.position.z);
+            }
+
+            // ===== 카트 모델 위치/회전 적용 =====
+            if (playerModel) {
+                playerModel.position.copy(player.position);
+                playerModel.rotation.y = player.headingAngle;
+                playerModel.rotation.z = -player.tiltAngle;
+            }
+
+            // ===== 파티클 위치 계산 =====
+            const backOffset = new THREE.Vector3(-Math.sin(player.headingAngle), 0.1, -Math.cos(player.headingAngle));
+            const particlePos = player.position.clone().add(backOffset);
+
+            // 속도 기준 연기 파티클
+            if (Math.abs(player.speed) > MAX_SPEED * 0.3 && smokeCooldown <= 0) {
+                createSmokeParticle(particlePos);
+                smokeCooldown = 0.05;
+            }
+
+            // 드리프트 시 불꽃 파티클
+            if (player.isDrifting && fireCooldown <= 0) {
+                createFireParticle(particlePos);
+                fireCooldown = 0.03;
+            }
+
+            updateParticles(dt); // 파티클 업데이트
+            updateCamera(); // 카메라 업데이트
+            // frogwa
+            if (player.isDrifting) {
+                const leftWheelPos = player.position.clone().add(sideDir.clone().multiplyScalar(-0.8));
+                const rightWheelPos = player.position.clone().add(sideDir.clone().multiplyScalar(0.8));
+
+                leftWheelPos.y = 0.01;   // 바닥 높이
+                rightWheelPos.y = 0.01;
+
+                addWheelMark(leftWheelPos);
+                addWheelMark(rightWheelPos);
+            }
+            // 엔진 사운드 볼륨 조절aww
+            const speedRatio = Math.abs(player.speed) / MAX_SPEED; // 0 ~ 1
+            engineAudio.volume = THREE.MathUtils.clamp(speedRatio, 0, 1);
+            if (player.isDrifting) {
+                if (driftAudio.paused) {
+                    driftAudio.currentTime = 0; // 항상 처음부터 재생
+                    driftAudio.play().catch(e => console.log('드리프트 재생 실패:', e));
+                }
+            } else {
+                if (!driftAudio.paused) {
+                    driftAudio.pause();
+                }
+            }
+            drawSpeedometer(player.speed);
+        }
+
+        // ===== 카메라 따라가기 =====
+        function updateCamera() {
+            const camOffsetBack = 6;
+            const camOffsetHeight = 3;
+            const camOffsetSide = 1.5;
+
+            const forwardDir = new THREE.Vector3(Math.sin(player.headingAngle), 0, Math.cos(player.headingAngle));
+            const sideDir = new THREE.Vector3(-forwardDir.z, 0, forwardDir.x);
+
+            const camPos = player.position.clone()
+                .addScaledVector(forwardDir, -camOffsetBack)
+                .addScaledVector(sideDir, camOffsetSide)
+                .add(new THREE.Vector3(0, camOffsetHeight, 0));
+
+            const tiltAmount = player.tiltAngle * 0.5;
+
+            camera.position.lerp(camPos, 0.1); // 카메라 부드럽게 이동
+            camera.rotation.z = THREE.MathUtils.lerp(camera.rotation.z, -tiltAmount, 0.1);
+
+            camera.lookAt(player.position); // 플레이어 바라보기
+        }
+
+        // ===== 애니메이션
+        function tick() {
+            const now = performance.now();
+            let dt = (now - last) / 1000;
+            last = now;
+            dt = Math.min(dt, 0.05);
+
+            update(dt);
+            renderer.render(scene, camera);
+            stats.update();
+
+            requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+        // frog
+        const wheelMarks = [];
+        const wheelRadius = 0.2;          // 바퀴 자국 반지름
+        const wheelSegments = 16;         // 원 세그먼트
+        const wheelDistanceThreshold = 0.08; // 바퀴 자국 간격
+        function addWheelMark(pos) {
+            const last = wheelMarks[wheelMarks.length - 1];
+            if (last && last.position.distanceTo(pos) < wheelDistanceThreshold) return;
+
+            const geom = new THREE.CircleGeometry(wheelRadius, wheelSegments);
+            const mat = new THREE.MeshBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.9 });
+            const circle = new THREE.Mesh(geom, mat);
+            circle.rotation.x = -Math.PI / 2; // 바닥에 맞춤
+            circle.position.copy(pos);
+
+            scene.add(circle);
+            wheelMarks.push(circle);
+        }
+        // ===== 오디오 생성 =====
+        const engineAudio = new Audio('engine.mp3');
+        document.body.addEventListener('click', () => {
+            document.body.requestPointerLock();
+
+            engineAudio.volume = 0;
+            engineAudio.loop = true;
+
+            // 1. 먼저 play 호출
+            engineAudio.currentTime = 2;
+            engineAudio.play().catch(e => console.log('재생 실패:', e));
+        });
+        const driftAudio = new Audio('drift.mp3');
+        driftAudio.loop = true;
+        driftAudio.volume = 0.2;
+        function drawSpeedometer(speed) {
+            const canvas = document.getElementById('speedometerCanvas');
+            const ctx = canvas.getContext('2d');
+            const maxSpeed = 200; // km/h 기준 최대 속도
+            const speedKmh = Math.abs(speed * 3.6);
+
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // 원형 테두리
+            ctx.beginPath();
+            ctx.arc(100, 100, 90, 0, Math.PI * 2);
+            ctx.strokeStyle = "#fff";
+            ctx.lineWidth = 4;
+            ctx.stroke();
+
+            // 눈금
+            for (let i = 0; i <= 10; i++) {
+                const angle = (Math.PI * 0.75) + (i / 10) * (Math.PI * 1.5);
+                const x1 = 100 + Math.cos(angle) * 75;
+                const y1 = 100 + Math.sin(angle) * 75;
+                const x2 = 100 + Math.cos(angle) * 85;
+                const y2 = 100 + Math.sin(angle) * 85;
+                ctx.beginPath();
+                ctx.moveTo(x1, y1);
+                ctx.lineTo(x2, y2);
+                ctx.stroke();
+            }
+
+            // 속도 바늘
+            const needleAngle = (Math.PI * 0.75) + (Math.min(speedKmh, maxSpeed) / maxSpeed) * (Math.PI * 1.5);
+            ctx.beginPath();
+            ctx.moveTo(100, 100);
+            ctx.lineTo(100 + Math.cos(needleAngle) * 70, 100 + Math.sin(needleAngle) * 70);
+            ctx.strokeStyle = "red";
+            ctx.lineWidth = 3;
+            ctx.stroke();
+
+            // 속도 표시 숫자
+            ctx.fillStyle = "#fff";
+            ctx.font = "20px Arial";
+            ctx.textAlign = "center";
+            ctx.fillText(`${Math.round(speedKmh)} km/h`, 100, 120);
+        }
+
+    </script>
+</body>
+
+</html>
